@@ -1,6 +1,6 @@
 using System.Collections;
 using UnityEngine;
-using UnityEngine.InputSystem; // Require the New Input System
+using UnityEngine.InputSystem;
 
 public enum MechState
 {
@@ -23,9 +23,14 @@ public class MechController : MonoBehaviour
     [Header("Movement Stats")]
     public float walkSpeed = 8f;
     public float dashSpeed = 22f;
-    public float stepSpeed = 40f;
-    public float stepDuration = 0.2f;
+    public float stepSpeed = 45f; // Slightly higher to account for the smooth decay
+    public float stepDuration = 0.25f;
+    public float ascendSpeed = 15f;
     public float gravity = -20f;
+
+    [Header("Inertia & Momentum")]
+    public float momentumDrag = 4f;
+    private Vector3 currentMomentum = Vector3.zero;
 
     [Header("Ground Check Settings")]
     public Transform groundCheckPoint;
@@ -36,20 +41,18 @@ public class MechController : MonoBehaviour
     public MechState currentState = MechState.Grounded;
     private Vector3 velocity;
 
-    // --- NEW INPUT SYSTEM VARIABLES ---
     private InputAction moveAction;
     private InputAction dashAction;
+    private InputAction jumpAction;
 
-    // Double-Flick (Step) detection variables
     private Vector2 lastFlickDir;
     private float lastFlickTime = 0f;
     private float doubleTapWindow = 0.3f;
     private bool wasStickNeutral = true;
-    private float stickDeadzone = 0.3f; // Prevents stick drift from triggering actions
+    private float stickDeadzone = 0.3f;
 
     private void Awake()
     {
-        // Programmatically setup the inputs so you don't need an Action Asset to test
         moveAction = new InputAction("Move", InputActionType.Value, "<Gamepad>/leftStick");
         moveAction.AddCompositeBinding("Dpad")
             .With("Up", "<Keyboard>/w")
@@ -57,20 +60,25 @@ public class MechController : MonoBehaviour
             .With("Left", "<Keyboard>/a")
             .With("Right", "<Keyboard>/d");
 
-        dashAction = new InputAction("Dash", InputActionType.Button, "<Gamepad>/buttonSouth"); // Cross on PS, A on Xbox
-        dashAction.AddBinding("<Keyboard>/space");
+        jumpAction = new InputAction("Jump", InputActionType.Button, "<Gamepad>/buttonSouth");
+        jumpAction.AddBinding("<Keyboard>/space");
+
+        dashAction = new InputAction("Dash", InputActionType.Button, "<Gamepad>/rightTrigger");
+        dashAction.AddBinding("<Keyboard>/shift");
     }
 
     private void OnEnable()
     {
         moveAction.Enable();
         dashAction.Enable();
+        jumpAction.Enable();
     }
 
     private void OnDisable()
     {
         moveAction.Disable();
         dashAction.Disable();
+        jumpAction.Disable();
     }
 
     private void Start()
@@ -81,12 +89,12 @@ public class MechController : MonoBehaviour
 
     private void Update()
     {
-        // 1. Handle Gravity & State Checking
         bool isGrounded = CheckIfGrounded();
 
+        // 1. Ground/Airborne Checks
         if (currentState != MechState.BoostStep)
         {
-            if (isGrounded && currentState != MechState.BoostDash)
+            if (isGrounded && currentState != MechState.BoostDash && !jumpAction.IsPressed())
             {
                 currentState = MechState.Grounded;
                 velocity.y = -2f;
@@ -99,12 +107,22 @@ public class MechController : MonoBehaviour
             }
         }
 
-        if (currentState != MechState.BoostDash && currentState != MechState.BoostStep)
+        // 2. Handle Vertical Movement 
+        if (currentState != MechState.BoostStep)
         {
-            velocity.y += gravity * Time.deltaTime;
+            if (jumpAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
+            {
+                velocity.y = ascendSpeed;
+                boostManager.ConsumeBoostOverTime(boostManager.dashDepletionRate);
+                currentState = MechState.Airborne;
+            }
+            else if (currentState != MechState.BoostDash)
+            {
+                velocity.y += gravity * Time.deltaTime;
+            }
         }
 
-        // 2. State Machine Logic
+        // 3. State Machine Logic
         switch (currentState)
         {
             case MechState.Grounded:
@@ -123,7 +141,6 @@ public class MechController : MonoBehaviour
                 break;
         }
 
-        // Apply vertical velocity
         controller.Move(velocity * Time.deltaTime);
     }
 
@@ -143,14 +160,22 @@ public class MechController : MonoBehaviour
         Vector3 targetForward = directionToTarget;
         Vector3 targetRight = Vector3.Cross(Vector3.up, targetForward);
 
-        // Read Vector2 from the New Input System
         Vector2 input = moveAction.ReadValue<Vector2>();
 
         Vector3 moveDir = (targetRight * input.x) + (targetForward * input.y);
-
         if (moveDir.magnitude > 1f) moveDir.Normalize();
 
-        controller.Move(moveDir * walkSpeed * Time.deltaTime);
+        Vector3 desiredMove = moveDir * walkSpeed;
+
+        currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * momentumDrag);
+
+        Vector3 finalMovement = desiredMove + currentMomentum;
+        if (finalMovement.magnitude > dashSpeed)
+        {
+            finalMovement = finalMovement.normalized * dashSpeed;
+        }
+
+        controller.Move(finalMovement * Time.deltaTime);
         FaceTarget();
     }
 
@@ -165,7 +190,8 @@ public class MechController : MonoBehaviour
 
     private void CheckForBoostDash()
     {
-        // Check if the dash button is held down
+        if (jumpAction.IsPressed()) return;
+
         if (dashAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
         {
             currentState = MechState.BoostDash;
@@ -175,7 +201,7 @@ public class MechController : MonoBehaviour
 
     private void HandleBoostDash()
     {
-        if (!dashAction.IsPressed() || !boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
+        if (!dashAction.IsPressed() || jumpAction.IsPressed() || !boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
         {
             currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
             return;
@@ -189,12 +215,13 @@ public class MechController : MonoBehaviour
         directionToTarget.y = 0;
         Vector3 targetRight = Vector3.Cross(Vector3.up, directionToTarget);
 
-        // If no input is provided, default to flying forward at the target
         if (input.magnitude < stickDeadzone) input.y = 1;
 
         Vector3 moveDir = (targetRight * input.x) + (directionToTarget * input.y);
-        controller.Move(moveDir.normalized * dashSpeed * Time.deltaTime);
 
+        currentMomentum = moveDir.normalized * dashSpeed;
+
+        controller.Move(currentMomentum * Time.deltaTime);
         FaceTarget();
     }
 
@@ -203,20 +230,17 @@ public class MechController : MonoBehaviour
         Vector2 currentInput = moveAction.ReadValue<Vector2>();
         bool isNeutral = currentInput.magnitude < stickDeadzone;
 
-        // Detect when the stick goes from neutral to pushed
         if (wasStickNeutral && !isNeutral)
         {
-            // Quantize the input to pure Up/Down/Left/Right to avoid diagonal step bugs
             Vector2 flickDir = GetPrimaryDirection(currentInput);
 
-            // Check if we double-flicked the SAME direction within the time window
             if (flickDir == lastFlickDir && Time.time - lastFlickTime < doubleTapWindow)
             {
                 if (boostManager.CanBoost(boostManager.stepCost))
                 {
                     StartCoroutine(ExecuteBoostStep(flickDir));
                 }
-                lastFlickTime = 0f; // Reset to prevent a triple-tap firing two dodges
+                lastFlickTime = 0f;
             }
             else
             {
@@ -224,11 +248,9 @@ public class MechController : MonoBehaviour
                 lastFlickTime = Time.time;
             }
         }
-
         wasStickNeutral = isNeutral;
     }
 
-    // Helper method to turn analog stick circles into a strict 4-way direction
     private Vector2 GetPrimaryDirection(Vector2 input)
     {
         if (Mathf.Abs(input.x) > Mathf.Abs(input.y))
@@ -243,6 +265,8 @@ public class MechController : MonoBehaviour
         boostManager.ConsumeBoost(boostManager.stepCost);
         velocity.y = 0;
 
+        currentMomentum = Vector3.zero;
+
         Debug.Log("TRACKING CUT INITIATED: Missiles lose lock-on!");
 
         Vector3 directionToTarget = (enemyTarget.position - transform.position).normalized;
@@ -253,13 +277,31 @@ public class MechController : MonoBehaviour
 
         float elapsedTime = 0f;
 
+        // NEW: The Dodge Inertia Math
         while (elapsedTime < stepDuration)
         {
-            controller.Move(stepVector.normalized * stepSpeed * Time.deltaTime);
+            float timeRatio = elapsedTime / stepDuration;
+
+            // Starts at stepSpeed (explosive) and smoothly Lerps down to walkSpeed (friction)
+            float currentStepSpeed = Mathf.Lerp(stepSpeed, walkSpeed, timeRatio);
+
+            controller.Move(stepVector.normalized * currentStepSpeed * Time.deltaTime);
             elapsedTime += Time.deltaTime;
             yield return null;
         }
 
+        // NEW: Seamlessly hand the final speed of the dodge back into the general momentum system!
+        currentMomentum = stepVector.normalized * walkSpeed;
+
         currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        if (groundCheckPoint != null)
+        {
+            Gizmos.color = CheckIfGrounded() ? Color.green : Color.red;
+            Gizmos.DrawWireSphere(groundCheckPoint.position, groundCheckRadius);
+        }
     }
 }
