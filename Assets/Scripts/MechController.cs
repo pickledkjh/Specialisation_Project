@@ -2,127 +2,97 @@ using System.Collections;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-public enum MechState
-{
-    Grounded,
-    Airborne,
-    BoostDash,
-    BoostStep,
-    Staggered
-}
+public enum MechState { Grounded, Airborne, BoostDash, BoostStep, Landing, Attacking, Staggered }
 
 [RequireComponent(typeof(CharacterController))]
 [RequireComponent(typeof(BoostManager))]
 public class MechController : MonoBehaviour
 {
-    [Header("References")]
     public Transform enemyTarget;
+    public Animator animator;
     private CharacterController controller;
     private BoostManager boostManager;
+    private MechCombat combatScript;
 
-    [Header("Movement Stats")]
-    public float walkSpeed = 8f;
-    public float dashSpeed = 22f;
-    public float stepSpeed = 45f; // Slightly higher to account for the smooth decay
-    public float stepDuration = 0.25f;
-    public float ascendSpeed = 15f;
-    public float gravity = -20f;
+    public float walkSpeed = 8f, dashSpeed = 22f, stepSpeed = 45f, stepDuration = 0.25f, ascendSpeed = 15f, gravity = -20f, bodyRotationSpeed = 15f, landingRecoveryTime = 0.8f, momentumDrag = 4f;
+    [HideInInspector] public Vector3 currentMomentum = Vector3.zero;
+    private Vector3 currentStepVelocity = Vector3.zero;
 
-    [Header("Inertia & Momentum")]
-    public float momentumDrag = 4f;
-    private Vector3 currentMomentum = Vector3.zero;
-
-    [Header("Ground Check Settings")]
     public Transform groundCheckPoint;
     public float groundCheckRadius = 0.4f;
     public LayerMask groundLayer;
 
-    [Header("State")]
     public MechState currentState = MechState.Grounded;
-    private Vector3 velocity;
+    public Vector3 velocity;
+    private float currentIKWeight = 1f;
 
-    private InputAction moveAction;
-    private InputAction dashAction;
-    private InputAction jumpAction;
-
+    private InputAction moveAction, dashAction, jumpAction;
     private Vector2 lastFlickDir;
-    private float lastFlickTime = 0f;
-    private float doubleTapWindow = 0.3f;
+    private float lastFlickTime = 0f, doubleTapWindow = 0.3f, stickDeadzone = 0.3f;
     private bool wasStickNeutral = true;
-    private float stickDeadzone = 0.3f;
 
     private void Awake()
     {
-        moveAction = new InputAction("Move", InputActionType.Value, "<Gamepad>/leftStick");
+        moveAction = new InputAction("Move", InputActionType.Value);
         moveAction.AddCompositeBinding("Dpad")
             .With("Up", "<Keyboard>/w")
             .With("Down", "<Keyboard>/s")
             .With("Left", "<Keyboard>/a")
             .With("Right", "<Keyboard>/d");
 
-        jumpAction = new InputAction("Jump", InputActionType.Button, "<Gamepad>/buttonSouth");
+        jumpAction = new InputAction("Jump", InputActionType.Button);
         jumpAction.AddBinding("<Keyboard>/space");
 
-        dashAction = new InputAction("Dash", InputActionType.Button, "<Gamepad>/rightTrigger");
+        dashAction = new InputAction("Dash", InputActionType.Button);
         dashAction.AddBinding("<Keyboard>/shift");
     }
 
-    private void OnEnable()
-    {
-        moveAction.Enable();
-        dashAction.Enable();
-        jumpAction.Enable();
-    }
-
-    private void OnDisable()
-    {
-        moveAction.Disable();
-        dashAction.Disable();
-        jumpAction.Disable();
-    }
+    private void OnEnable() { moveAction.Enable(); dashAction.Enable(); jumpAction.Enable(); }
+    private void OnDisable() { moveAction.Disable(); dashAction.Disable(); jumpAction.Disable(); }
 
     private void Start()
     {
         controller = GetComponent<CharacterController>();
         boostManager = GetComponent<BoostManager>();
+        combatScript = GetComponent<MechCombat>();
+        if (animator == null) animator = GetComponentInChildren<Animator>();
     }
 
     private void Update()
     {
         bool isGrounded = CheckIfGrounded();
 
-        // 1. Ground/Airborne Checks
-        if (currentState != MechState.BoostStep)
+        // 1. Check Grounded/Airborne State Transitions
+        if (currentState != MechState.BoostStep && currentState != MechState.Landing && currentState != MechState.Attacking && currentState != MechState.Staggered)
         {
             if (isGrounded && currentState != MechState.BoostDash && !jumpAction.IsPressed())
             {
-                currentState = MechState.Grounded;
-                velocity.y = -2f;
-                boostManager.Regenerate(true);
+                if (currentState == MechState.Airborne) StartCoroutine(ExecuteLandingRecovery());
+                else { currentState = MechState.Grounded; velocity.y = -2f; boostManager.Regenerate(true); }
             }
-            else if (!isGrounded && currentState != MechState.BoostDash)
-            {
-                currentState = MechState.Airborne;
-                boostManager.Regenerate(false);
-            }
+            else if (!isGrounded && currentState != MechState.BoostDash) { currentState = MechState.Airborne; boostManager.Regenerate(false); }
         }
 
-        // 2. Handle Vertical Movement 
-        if (currentState != MechState.BoostStep)
+        // 2. Handle Jump & Gravity
+        if (currentState != MechState.Landing && currentState != MechState.Attacking && currentState != MechState.Staggered)
         {
             if (jumpAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
             {
+                if (currentState == MechState.BoostStep) { StopAllCoroutines(); currentMomentum = currentStepVelocity * 1.3f; }
                 velocity.y = ascendSpeed;
                 boostManager.ConsumeBoostOverTime(boostManager.dashDepletionRate);
                 currentState = MechState.Airborne;
             }
-            else if (currentState != MechState.BoostDash)
-            {
-                velocity.y += gravity * Time.deltaTime;
-            }
+            else if (currentState != MechState.BoostDash && currentState != MechState.BoostStep) velocity.y += gravity * Time.deltaTime;
+        }
+        else if (currentState == MechState.Attacking || currentState == MechState.Landing || currentState == MechState.Staggered)
+        {
+            // Still apply gravity during these locked states so the mech doesn't float forever
+            if (!isGrounded) velocity.y += gravity * Time.deltaTime;
+            else velocity.y = -2f;
         }
 
-        // 3. State Machine Logic
+        // 3. Movement Logic Based on State
         switch (currentState)
         {
             case MechState.Grounded:
@@ -131,71 +101,107 @@ public class MechController : MonoBehaviour
                 CheckForBoostStepInput();
                 CheckForBoostDash();
                 break;
-
             case MechState.BoostDash:
                 HandleBoostDash();
                 break;
-
             case MechState.BoostStep:
                 FaceTarget();
+                break;
+            case MechState.Attacking:
+                CheckForBoostStepInput();
+                CheckForBoostDash();
+                currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * 6f);
+                controller.Move(currentMomentum * Time.deltaTime);
+                break;
+            case MechState.Landing:
+                currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * 6f);
+                controller.Move(currentMomentum * Time.deltaTime);
+                break;
+            case MechState.Staggered:
+                // Hard brake on momentum when staggered
+                currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * 10f);
+                controller.Move(currentMomentum * Time.deltaTime);
                 break;
         }
 
         controller.Move(velocity * Time.deltaTime);
+        UpdateAnimations(isGrounded);
     }
 
-    private bool CheckIfGrounded()
+    private void OnAnimatorIK(int layerIndex)
     {
-        if (groundCheckPoint == null) return false;
-        return Physics.CheckSphere(groundCheckPoint.position, groundCheckRadius, groundLayer);
+        if (animator == null || enemyTarget == null) return;
+        float targetWeight = (currentState == MechState.Attacking || currentState == MechState.Staggered) ? 0f : 1f;
+        currentIKWeight = Mathf.Lerp(currentIKWeight, targetWeight, Time.deltaTime * 15f);
+        animator.SetLookAtWeight(currentIKWeight, currentIKWeight * 0.2f, currentIKWeight, currentIKWeight, 0.6f);
+        animator.SetLookAtPosition(enemyTarget.position + (Vector3.up * 1.5f));
+    }
+
+    private void UpdateAnimations(bool isGrounded)
+    {
+        if (animator == null) return;
+        Vector2 input = moveAction.ReadValue<Vector2>();
+
+        // Zero out leg animations when locked in animations
+        if (currentState == MechState.Landing || currentState == MechState.Attacking || currentState == MechState.Staggered)
+            input = Vector2.zero;
+
+        animator.SetFloat("InputY", Mathf.Clamp01(input.magnitude), 0.1f, Time.deltaTime);
+        animator.SetBool("IsGrounded", isGrounded);
+        animator.SetBool("IsDashing", currentState == MechState.BoostDash);
+        animator.SetBool("IsAscending", !isGrounded && velocity.y > 0 && currentState != MechState.BoostDash);
+    }
+
+    public bool CheckIfGrounded() => groundCheckPoint != null && Physics.CheckSphere(groundCheckPoint.position, groundCheckRadius, groundLayer);
+
+    // --- DAMAGE & STAGGER LOGIC ---
+    public void TakeHit(float staggerDuration = 0.8f)
+    {
+        // 1. Cancel any attacks or booststeps immediately
+        StopAllCoroutines();
+        if (combatScript != null) combatScript.CancelAttack();
+
+        // 2. Stop movement momentum
+        currentMomentum = Vector3.zero;
+        velocity.x = 0;
+        velocity.z = 0;
+
+        // 3. Set state and trigger animation
+        currentState = MechState.Staggered;
+        if (animator != null) animator.SetTrigger("GetHit");
+
+        // 4. Start the recovery timer
+        StartCoroutine(StaggerRecoveryRoutine(staggerDuration));
+    }
+
+    private IEnumerator StaggerRecoveryRoutine(float duration)
+    {
+        yield return new WaitForSeconds(duration);
+        currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
     }
 
     private void HandleTargetCentricMovement()
     {
         if (enemyTarget == null) return;
-
-        Vector3 directionToTarget = (enemyTarget.position - transform.position).normalized;
-        directionToTarget.y = 0;
-
-        Vector3 targetForward = directionToTarget;
-        Vector3 targetRight = Vector3.Cross(Vector3.up, targetForward);
-
+        Vector3 dirToTarget = (enemyTarget.position - transform.position).normalized; dirToTarget.y = 0;
         Vector2 input = moveAction.ReadValue<Vector2>();
-
-        Vector3 moveDir = (targetRight * input.x) + (targetForward * input.y);
-        if (moveDir.magnitude > 1f) moveDir.Normalize();
-
-        Vector3 desiredMove = moveDir * walkSpeed;
-
+        Vector3 moveDir = (Vector3.Cross(Vector3.up, dirToTarget) * input.x) + (dirToTarget * input.y);
+        if (moveDir.magnitude > 0.05f) transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(moveDir), Time.deltaTime * bodyRotationSpeed);
         currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * momentumDrag);
-
-        Vector3 finalMovement = desiredMove + currentMomentum;
-        if (finalMovement.magnitude > dashSpeed)
-        {
-            finalMovement = finalMovement.normalized * dashSpeed;
-        }
-
-        controller.Move(finalMovement * Time.deltaTime);
-        FaceTarget();
+        controller.Move(((moveDir * walkSpeed) + currentMomentum) * Time.deltaTime);
     }
 
     private void FaceTarget()
     {
-        if (enemyTarget == null) return;
-
-        Vector3 lookPos = enemyTarget.position;
-        lookPos.y = transform.position.y;
-        transform.LookAt(lookPos);
+        if (enemyTarget != null) transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(enemyTarget.position - transform.position), Time.deltaTime * 20f);
     }
 
     private void CheckForBoostDash()
     {
-        if (jumpAction.IsPressed()) return;
-
-        if (dashAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
+        if (!jumpAction.IsPressed() && dashAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
         {
-            currentState = MechState.BoostDash;
-            velocity.y = 0f;
+            if (currentState == MechState.Attacking && combatScript != null) combatScript.CancelAttack();
+            currentState = MechState.BoostDash; velocity.y = 0f;
         }
     }
 
@@ -203,105 +209,65 @@ public class MechController : MonoBehaviour
     {
         if (!dashAction.IsPressed() || jumpAction.IsPressed() || !boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
         {
-            currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
+            if (CheckIfGrounded()) StartCoroutine(ExecuteLandingRecovery());
+            else currentState = MechState.Airborne;
             return;
         }
-
         boostManager.ConsumeBoostOverTime(boostManager.dashDepletionRate);
-
+        Vector3 dirToTarget = (enemyTarget.position - transform.position).normalized; dirToTarget.y = 0;
         Vector2 input = moveAction.ReadValue<Vector2>();
-
-        Vector3 directionToTarget = (enemyTarget.position - transform.position).normalized;
-        directionToTarget.y = 0;
-        Vector3 targetRight = Vector3.Cross(Vector3.up, directionToTarget);
-
-        if (input.magnitude < stickDeadzone) input.y = 1;
-
-        Vector3 moveDir = (targetRight * input.x) + (directionToTarget * input.y);
-
+        Vector3 moveDir = (Vector3.Cross(Vector3.up, dirToTarget) * input.x) + (dirToTarget * (input.magnitude < 0.3f ? 1 : input.y));
+        transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(moveDir), Time.deltaTime * bodyRotationSpeed);
         currentMomentum = moveDir.normalized * dashSpeed;
-
         controller.Move(currentMomentum * Time.deltaTime);
-        FaceTarget();
     }
 
     private void CheckForBoostStepInput()
     {
-        Vector2 currentInput = moveAction.ReadValue<Vector2>();
-        bool isNeutral = currentInput.magnitude < stickDeadzone;
-
-        if (wasStickNeutral && !isNeutral)
+        Vector2 input = moveAction.ReadValue<Vector2>();
+        if (wasStickNeutral && input.magnitude > stickDeadzone)
         {
-            Vector2 flickDir = GetPrimaryDirection(currentInput);
-
-            if (flickDir == lastFlickDir && Time.time - lastFlickTime < doubleTapWindow)
+            Vector2 dir = Mathf.Abs(input.x) > Mathf.Abs(input.y) ? (input.x > 0 ? Vector2.right : Vector2.left) : (input.y > 0 ? Vector2.up : Vector2.down);
+            if (dir == lastFlickDir && Time.time - lastFlickTime < doubleTapWindow)
             {
                 if (boostManager.CanBoost(boostManager.stepCost))
                 {
-                    StartCoroutine(ExecuteBoostStep(flickDir));
+                    if (currentState == MechState.Attacking && combatScript != null) combatScript.CancelAttack();
+                    StartCoroutine(ExecuteBoostStep(dir));
                 }
                 lastFlickTime = 0f;
             }
-            else
-            {
-                lastFlickDir = flickDir;
-                lastFlickTime = Time.time;
-            }
+            else { lastFlickDir = dir; lastFlickTime = Time.time; }
         }
-        wasStickNeutral = isNeutral;
+        wasStickNeutral = input.magnitude < stickDeadzone;
     }
 
-    private Vector2 GetPrimaryDirection(Vector2 input)
+    private IEnumerator ExecuteBoostStep(Vector2 dir)
     {
-        if (Mathf.Abs(input.x) > Mathf.Abs(input.y))
-            return input.x > 0 ? Vector2.right : Vector2.left;
-        else
-            return input.y > 0 ? Vector2.up : Vector2.down;
-    }
+        currentState = MechState.BoostStep; boostManager.ConsumeBoost(boostManager.stepCost);
+        Vector3 dirToTarget = (enemyTarget.position - transform.position).normalized; dirToTarget.y = 0;
+        Vector3 stepVec = (Vector3.Cross(Vector3.up, dirToTarget) * dir.x) + (dirToTarget * dir.y);
 
-    private IEnumerator ExecuteBoostStep(Vector2 inputDir)
-    {
-        currentState = MechState.BoostStep;
-        boostManager.ConsumeBoost(boostManager.stepCost);
-        velocity.y = 0;
-
-        currentMomentum = Vector3.zero;
-
-        Debug.Log("TRACKING CUT INITIATED: Missiles lose lock-on!");
-
-        Vector3 directionToTarget = (enemyTarget.position - transform.position).normalized;
-        directionToTarget.y = 0;
-        Vector3 targetRight = Vector3.Cross(Vector3.up, directionToTarget);
-
-        Vector3 stepVector = (targetRight * inputDir.x) + (directionToTarget * inputDir.y);
-
-        float elapsedTime = 0f;
-
-        // NEW: The Dodge Inertia Math
-        while (elapsedTime < stepDuration)
+        if (animator != null)
         {
-            float timeRatio = elapsedTime / stepDuration;
-
-            // Starts at stepSpeed (explosive) and smoothly Lerps down to walkSpeed (friction)
-            float currentStepSpeed = Mathf.Lerp(stepSpeed, walkSpeed, timeRatio);
-
-            controller.Move(stepVector.normalized * currentStepSpeed * Time.deltaTime);
-            elapsedTime += Time.deltaTime;
-            yield return null;
+            animator.SetFloat("StepX", dir.x);
+            animator.SetFloat("StepY", dir.y);
+            animator.SetTrigger("DoStep");
         }
 
-        // NEW: Seamlessly hand the final speed of the dodge back into the general momentum system!
-        currentMomentum = stepVector.normalized * walkSpeed;
-
+        float elapsed = 0f;
+        while (elapsed < stepDuration)
+        {
+            currentStepVelocity = stepVec.normalized * Mathf.Lerp(stepSpeed, walkSpeed, elapsed / stepDuration);
+            controller.Move(currentStepVelocity * Time.deltaTime);
+            elapsed += Time.deltaTime; yield return null;
+        }
         currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
     }
 
-    private void OnDrawGizmosSelected()
+    private IEnumerator ExecuteLandingRecovery()
     {
-        if (groundCheckPoint != null)
-        {
-            Gizmos.color = CheckIfGrounded() ? Color.green : Color.red;
-            Gizmos.DrawWireSphere(groundCheckPoint.position, groundCheckRadius);
-        }
+        currentState = MechState.Landing; velocity.y = -2f; boostManager.Regenerate(true);
+        yield return new WaitForSeconds(landingRecoveryTime); currentState = MechState.Grounded;
     }
 }
