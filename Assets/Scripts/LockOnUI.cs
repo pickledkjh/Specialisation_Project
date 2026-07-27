@@ -1,19 +1,20 @@
 using UnityEngine;
-using UnityEngine.UI; // Required for interacting with Canvas Images
+using UnityEngine.UI;
 
 public class LockOnUI : MonoBehaviour
 {
     [Header("References")]
-    public MechCombat playerCombat; // We use this to read your exact Red Lock distance!
+    public MechCombat playerCombat;
     public Transform enemyTarget;
     public Image lockOnImage;
 
     [Header("Sprites")]
     public Sprite greenLockSprite;
     public Sprite redLockSprite;
+    public Sprite yellowLockSprite;
 
     [Header("Settings")]
-    public Vector3 targetOffset = new Vector3(0, 1.5f, 0); // Lifts the UI so it hovers over the chest/head, not the feet
+    public Vector3 targetOffset = new Vector3(0, 1.5f, 0);
 
     private Camera mainCamera;
 
@@ -24,20 +25,26 @@ public class LockOnUI : MonoBehaviour
 
     private void Update()
     {
-        // If we don't have a target, hide the reticle
         if (enemyTarget == null || playerCombat == null || lockOnImage == null)
         {
             lockOnImage.enabled = false;
             return;
         }
 
-        // 1. Calculate the 3D Distance (ignoring height)
         Vector3 toTarget = enemyTarget.position - playerCombat.transform.position;
         toTarget.y = 0;
         float distance = toTarget.magnitude;
 
-        // 2. Swap the PNG based on the range set in your Combat script
-        if (distance <= playerCombat.redLockRange)
+        // FIX: Search thoroughly for the health script on the exact target, its parents, or its children
+        MechHealth targetHealth = enemyTarget.GetComponent<MechHealth>();
+        if (targetHealth == null) targetHealth = enemyTarget.GetComponentInParent<MechHealth>();
+        if (targetHealth == null) targetHealth = enemyTarget.GetComponentInChildren<MechHealth>();
+
+        if (targetHealth != null && targetHealth.isYellowLocked)
+        {
+            lockOnImage.sprite = yellowLockSprite;
+        }
+        else if (distance <= playerCombat.redLockRange)
         {
             lockOnImage.sprite = redLockSprite;
         }
@@ -46,10 +53,8 @@ public class LockOnUI : MonoBehaviour
             lockOnImage.sprite = greenLockSprite;
         }
 
-        // 3. Project the 3D position onto your 2D screen
         Vector3 screenPosition = mainCamera.WorldToScreenPoint(enemyTarget.position + targetOffset);
 
-        // Only display the lock-on if the enemy is in front of the camera (Z > 0)
         if (screenPosition.z > 0)
         {
             lockOnImage.enabled = true;
@@ -57,7 +62,7 @@ public class LockOnUI : MonoBehaviour
         }
         else
         {
-            lockOnImage.enabled = false; // Hide it if they are behind the camera
+            lockOnImage.enabled = false;
         }
     }
 }
