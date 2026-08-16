@@ -59,12 +59,66 @@ public class LockOnBattleCamera : MonoBehaviour
     private bool initialized;
     private MechController playerController;
 
+    /// <summary>Live instance, for gameplay systems that want camera flourishes.</summary>
+    public static LockOnBattleCamera Instance { get; private set; }
+
+    // Temporary extra pull-back requested by specials/branch combos (decays out)
+    private float kickExtra;
+    private float kickUntil = -99f;
+
+    /// <summary>Pulls the camera back by extraDistance for the given duration - a cheap
+    /// but effective "something big is happening" flourish for specials.</summary>
+    public void SpecialKick(float extraDistance, float duration)
+    {
+        kickExtra = extraDistance;
+        kickUntil = Time.time + duration;
+    }
+
+    // Impact shake: small random jitter that decays out fast. Strength is world
+    // units at the moment of the call; explosions/knockdowns feel physical with it.
+    private float shakeStrength;
+    private float shakeUntil = -99f;
+    private float shakeDuration = 0.3f;
+
+    /// <summary>Shakes the camera. Keep strength modest (0.1-0.4) - this is a
+    /// punctuation mark, not an earthquake.</summary>
+    public void Shake(float strength, float duration = 0.3f)
+    {
+        if (!GameSettings.ScreenShake) return; // player turned shake off in SETTINGS
+        if (strength < shakeStrength && Time.time < shakeUntil) return; // don't downgrade an active shake
+        shakeStrength = strength;
+        shakeDuration = Mathf.Max(0.05f, duration);
+        shakeUntil = Time.time + shakeDuration;
+    }
+
+    private Vector3 CurrentShakeOffset()
+    {
+        float remain = shakeUntil - Time.time;
+        if (remain <= 0f) return Vector3.zero;
+        float k = remain / shakeDuration; // 1 -> 0
+        float s = shakeStrength * k * k;
+        return new Vector3(
+            (Mathf.PerlinNoise(Time.time * 31f, 0.3f) - 0.5f) * 2f,
+            (Mathf.PerlinNoise(0.7f, Time.time * 37f) - 0.5f) * 2f,
+            0f) * s;
+    }
+
     // Rate-limited orbit direction (the smoothed "behind the player" vector)
     private Vector3 smoothedBack;
     private bool backInitialized;
 
     private void Start()
     {
+        Instance = this;
+
+        // Camera wall-avoidance (playtest finding: buildings occlude the fight).
+        // The Deoccluder rides on the same GameObject as the CinemachineCamera.
+        if (GetComponent<Unity.Cinemachine.CinemachineDeoccluder>() == null &&
+            GetComponent<Unity.Cinemachine.CinemachineCamera>() != null)
+        {
+            gameObject.AddComponent<Unity.Cinemachine.CinemachineDeoccluder>();
+        }
+
         if (player == null)
         {
             MechController pc = FindFirstObjectByType<MechController>();
@@ -95,11 +149,50 @@ public class LockOnBattleCamera : MonoBehaviour
         return null;
     }
 
+    // ---- Gerobi cinematic: a low hero-shot sweep around the mech during the
+    // laser windup/lift-off, releasing into the normal framing as the beam fires.
+    private Transform cineFocus;
+    private float cineStart = -99f, cineUntil = -99f;
+
+    /// <summary>Sweeps the camera low around 'focus' for 'duration' seconds -
+    /// the pre-fire flourish for the E laser (or any big special).</summary>
+    public void SpecialCinematic(Transform focus, float duration)
+    {
+        cineFocus = focus;
+        cineStart = Time.time;
+        cineUntil = Time.time + duration;
+    }
+
+    private bool RunCinematic()
+    {
+        if (Time.time >= cineUntil || cineFocus == null) return false;
+        float k = Mathf.Clamp01((Time.time - cineStart) / Mathf.Max(0.01f, cineUntil - cineStart));
+
+        // Start low at the mech's side-front, sweep across its face while craning
+        // up with the lift-off - ends roughly behind, so the release doesn't whip.
+        float ang = Mathf.Lerp(55f, 165f, k);          // degrees around from its facing
+        float dist = Mathf.Lerp(3.6f, 5.4f, k);
+        float camH = Mathf.Lerp(0.5f, 2.6f, k * k);    // low angle first, crane up late
+        Vector3 around = Quaternion.AngleAxis(ang, Vector3.up) * cineFocus.forward;
+        Vector3 pos = cineFocus.position + around * dist + Vector3.up * camH;
+
+        float lerp = 1f - Mathf.Exp(-9f * Time.deltaTime);
+        transform.position = Vector3.Lerp(transform.position, pos, lerp);
+
+        Vector3 aim = cineFocus.position + Vector3.up * 1.5f;
+        currentAim = Vector3.Lerp(currentAim, aim, 1f - Mathf.Exp(-14f * Time.deltaTime));
+        Vector3 look = currentAim - transform.position;
+        if (look.sqrMagnitude > 0.001f)
+            transform.rotation = Quaternion.LookRotation(look.normalized);
+        return true;
+    }
+
     // LateUpdate AFTER gameplay movement; the CinemachineBrain reads this transform
     // in its own later pass.
     private void LateUpdate()
     {
         if (player == null) return;
+        if (RunCinematic()) return; // special windup owns the camera this frame
 
         Transform enemy = GetEnemy();
         Vector3 desiredPos;
@@ -142,7 +235,10 @@ public class LockOnBattleCamera : MonoBehaviour
                                     Mathf.Max(0f, enemyDist - nearRange) * pullbackPerUnit)
                         + Mathf.Min(5f, vSep * verticalPullback);
 
-            desiredPos = player.position + back * (baseDistance + extra) + Vector3.up * height;
+            // Special-move flourish: extra pull-back that eases off after the move
+            float kick = Time.time < kickUntil ? kickExtra : Mathf.Max(0f, kickExtra - (Time.time - kickUntil) * 6f);
+
+            desiredPos = player.position + back * (baseDistance + extra + kick) + Vector3.up * height;
 
             // Horizontally the aim stays glued to the enemy (the EXVS trait), but
             // the VERTICAL aim splits the difference between the two mechs - so
@@ -159,6 +255,12 @@ public class LockOnBattleCamera : MonoBehaviour
             desiredAim = player.position + player.forward * 10f + Vector3.up * aimHeight;
         }
 
+        ApplyFraming(desiredPos, desiredAim);
+    }
+
+    // Shared smoothing + shake + look.
+    private void ApplyFraming(Vector3 desiredPos, Vector3 desiredAim)
+    {
         if (!initialized)
         {
             // First frame: snap, so we don't lerp in from wherever we spawned
@@ -180,6 +282,11 @@ public class LockOnBattleCamera : MonoBehaviour
             float aLerp = 1f - Mathf.Exp(-aimDamping * Time.deltaTime);
             currentAim = Vector3.Lerp(currentAim, desiredAim, aLerp);
         }
+
+        // Impact shake rides on top of the smoothed position so it never fights
+        // the damping (applied post-smoothing, decays on its own).
+        Vector3 shake = CurrentShakeOffset();
+        if (shake != Vector3.zero) transform.position += transform.rotation * shake;
 
         Vector3 lookDir = currentAim - transform.position;
         if (lookDir.sqrMagnitude > 0.001f)

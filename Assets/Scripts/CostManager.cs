@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 
 // Defines the two teams in the game
 public enum Team
@@ -17,6 +17,10 @@ public class CostManager : MonoBehaviour
 
     [SerializeField] private int team1CurrentCost;
     [SerializeField] private int team2CurrentCost;
+
+    // Read-only access for the HUD's EXVS-style cost readouts
+    public int Team1Cost => team1CurrentCost;
+    public int Team2Cost => team2CurrentCost;
 
     private void Awake()
     {
@@ -38,6 +42,14 @@ public class CostManager : MonoBehaviour
         team2CurrentCost = maxTeamCost;
 
         Debug.Log($"Match Started! Both teams have {maxTeamCost} Cost.");
+    }
+
+    /// <summary>Refills both pools. The mission runs three stages off one enemy team
+    /// pool, so this is called when a NEW mission starts, not between stages.</summary>
+    public void ResetPools()
+    {
+        team1CurrentCost = maxTeamCost;
+        team2CurrentCost = maxTeamCost;
     }
 
     // Called by a mech when its HP hits 0

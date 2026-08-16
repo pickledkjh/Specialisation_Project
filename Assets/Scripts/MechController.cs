@@ -28,6 +28,8 @@ public class MechController : MonoBehaviour
     public float bodyRotationSpeed = 15f;
 
     [Header("EXVS Boost Feel")]
+    [Tooltip("Extra multiplier on BOOST DASH speed only (on top of bigMapSpeedScale). 2 = double-speed dashes - crossing the big arena is a dash decision, not a hike.")]
+    public float dashSpeedScale = 2f;
     [Tooltip("Speed of the initial dash snap.")]
     public float dashBurstSpeed = 30f;
     [Tooltip("Speed the dash holds while the button stays down. Keep this HIGH — an EXVS dash does not slow down while held.")]
@@ -76,6 +78,15 @@ public class MechController : MonoBehaviour
     private Transform modelT;
     private Vector3 modelBaseLocalPos;
     private bool modelBaseCaptured;
+
+    /// <summary>
+    /// Time of this mech's last boost step OR boost dash start. Read by
+    /// HomingProjectile: any shot fired BEFORE this moment loses its homing —
+    /// the EXVS "stepping breaks tracking" rule, the designed counter to the
+    /// "aimbot bullets" complaint.
+    /// </summary>
+    public float LastEvadeTime { get; private set; } = -99f;
+    public void MarkEvade() { LastEvadeTime = Time.time; }
 
     private InputAction moveAction, dashAction, jumpAction;
     private Vector2 lastFlickDir;
@@ -134,11 +145,17 @@ public class MechController : MonoBehaviour
 
     private void Update()
     {
+        if (Time.timeScale < 0.5f) return; // paused / cut-in / finisher freeze: no input, no state changes
+
         bool isGrounded = CheckIfGrounded();
+        // Guard fully roots the mech: no walk (zeroed in the movement handlers),
+        // and now no rise, no dash, no step either. Holding SPACE/SHIFT behind a
+        // raised shield used to keep you fully mobile, which made guarding free.
+        bool shielding = combatScript != null && combatScript.IsShielding;
 
         if (currentState != MechState.BoostStep && currentState != MechState.Landing && currentState != MechState.Attacking && currentState != MechState.Staggered)
         {
-            if (isGrounded && currentState != MechState.BoostDash && !jumpAction.IsPressed())
+            if (isGrounded && currentState != MechState.BoostDash && (!jumpAction.IsPressed() || shielding))
             {
                 if (currentState == MechState.Airborne) StartCoroutine(ExecuteLandingRecovery());
                 else { currentState = MechState.Grounded; velocity.y = -2f; boostManager.Regenerate(true); }
@@ -148,7 +165,7 @@ public class MechController : MonoBehaviour
 
         if (currentState != MechState.Landing && currentState != MechState.Attacking && currentState != MechState.Staggered)
         {
-            if (jumpAction.IsPressed() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
+            if (jumpAction.IsPressed() && !shielding && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
             {
                 if (currentState == MechState.BoostStep) { StopAllCoroutines(); currentMomentum = currentStepVelocity * 1.3f; }
                 // Crisp rise: high ramp speed so the reversal out of a fall is near-instant
@@ -177,13 +194,22 @@ public class MechController : MonoBehaviour
             }
         }
 
+        // BOOST STEP WATCHDOG. While stepping, the state machine deliberately ignores
+        // movement input. If the step coroutine is ever killed mid-way (StopAllCoroutines
+        // from a hit, a knockdown, an overlapping step) the state sticks and the mech is
+        // unresponsive forever. Nothing should be in BoostStep for more than a step.
+        if (currentState == MechState.BoostStep && Time.time - stepStartedAt > stepDuration * 2.5f + 0.2f)
+        {
+            currentState = isGrounded ? MechState.Grounded : MechState.Airborne;
+            currentStepVelocity = Vector3.zero;
+        }
+
         switch (currentState)
         {
             case MechState.Grounded:
             case MechState.Airborne:
                 HandleTargetCentricMovement(isGrounded);
-                CheckForBoostStepInput();
-                CheckForBoostDash();
+                if (!shielding) { CheckForBoostStepInput(); CheckForBoostDash(); }
                 break;
             case MechState.BoostDash:
                 HandleBoostDash();
@@ -247,12 +273,27 @@ public class MechController : MonoBehaviour
         animator.SetBool("IsAscending", !isGrounded && velocity.y > 0 && currentState != MechState.BoostDash);
     }
 
-    public bool CheckIfGrounded() => groundCheckPoint != null && Physics.CheckSphere(groundCheckPoint.position, groundCheckRadius, groundLayer);
+    // ANY solid surface counts as ground now - rooftops, cars, props, not just the
+    // "ground layer". The old layer-mask check meant landing on a building never
+    // registered as landing (no recovery, boost never recharged). Triggers are
+    // ignored and the mech's own colliders are excluded.
+    private static readonly Collider[] groundBuf = new Collider[8];
+    public bool CheckIfGrounded()
+    {
+        if (groundCheckPoint == null) return false;
+        int n = Physics.OverlapSphereNonAlloc(groundCheckPoint.position, groundCheckRadius, groundBuf, ~0, QueryTriggerInteraction.Ignore);
+        for (int i = 0; i < n; i++)
+        {
+            Collider c = groundBuf[i];
+            if (c != null && c.transform.root != transform.root) return true;
+        }
+        return false;
+    }
 
     public void TakeHit(float staggerDuration = 0.8f)
     {
         StopAllCoroutines();
-        if (combatScript != null) combatScript.CancelAttack();
+        if (combatScript != null) combatScript.CancelAttack(interruptedByHit: true); // counter-hit: the victim earned the escape, no free down
         if (animator != null) animator.speed = 1f; // in case a previous hit-stop was interrupted
 
         currentMomentum = Vector3.zero;
@@ -308,8 +349,11 @@ public class MechController : MonoBehaviour
         currentMomentum = Vector3.Lerp(currentMomentum, Vector3.zero, Time.deltaTime * drag);
 
         float control = isGrounded ? 1f : airControlFactor;
-        controller.Move(((moveDir * walkSpeed * control) + currentMomentum) * Time.deltaTime);
+        controller.Move(((moveDir * walkSpeed * bigMapSpeedScale * control) + currentMomentum) * Time.deltaTime);
     }
+
+    [Tooltip("Movement multiplier for the 3x arena - scales walking, dashing and steps together so the bigger map doesn't feel like hiking. NEW field (not baked into the scene), so tune it freely here.")]
+    public float bigMapSpeedScale = 1.3f;
 
     private void FaceTarget()
     {
@@ -322,6 +366,7 @@ public class MechController : MonoBehaviour
         if (!jumpAction.IsPressed() && dashAction.WasPressedThisFrame() && boostManager.CanBoost(boostManager.dashDepletionRate * Time.deltaTime))
         {
             if (currentState == MechState.Attacking && combatScript != null) combatScript.CancelAttack();
+            MarkEvade(); // dashing breaks incoming shot tracking (EXVS rule)
             dashStartTime = Time.time; // start of the burst curve
             currentState = MechState.BoostDash;
             // Ground dash pops you slightly off the floor; air dash levels you out
@@ -360,7 +405,7 @@ public class MechController : MonoBehaviour
 
         // Quick snap into a fast, sustained cruise — the dash never bleeds speed while held
         float t = dashBurstSettleTime > 0f ? Mathf.Clamp01((Time.time - dashStartTime) / dashBurstSettleTime) : 1f;
-        float speed = Mathf.Lerp(dashBurstSpeed, dashCruiseSpeed, t);
+        float speed = Mathf.Lerp(dashBurstSpeed, dashCruiseSpeed, t) * bigMapSpeedScale * dashSpeedScale;
 
         currentMomentum = moveDir * speed;
         controller.Move(currentMomentum * Time.deltaTime);
@@ -377,13 +422,63 @@ public class MechController : MonoBehaviour
                 if (boostManager.CanBoost(boostManager.stepCost))
                 {
                     if (currentState == MechState.Attacking && combatScript != null) combatScript.CancelAttack();
-                    StartCoroutine(ExecuteBoostStep(dir));
+                    MarkEvade(); // stepping breaks incoming shot tracking
+                    // Never let two steps run at once - overlapping coroutines fought
+                    // over the state and could leave it stuck in BoostStep.
+                    if (stepRoutine != null) StopCoroutine(stepRoutine);
+                    stepRoutine = StartCoroutine(ExecuteBoostStep(dir));
                 }
                 lastFlickTime = 0f;
             }
             else { lastFlickDir = dir; lastFlickTime = Time.time; }
         }
-        wasStickNeutral = input.magnitude < stickDeadzone;
+        // FALSE NEUTRAL - the "hold D, then press A and everything hangs" bug.
+        // WASD is a COMPOSITE axis: holding right and pressing left sums to x = 0,
+        // which reads as "stick released" even though both keys are down. Releasing
+        // one then registered as a fresh flick, which paired with the previous one
+        // as a double-tap and fired an unwanted boost step - and while the mech is
+        // in BoostStep the state machine ignores movement input entirely, so it
+        // looked like the player froze. A neutral only counts when NO movement key
+        // is actually held.
+        bool anyMoveKeyHeld = Keyboard.current != null &&
+            (Keyboard.current.wKey.isPressed || Keyboard.current.aKey.isPressed ||
+             Keyboard.current.sKey.isPressed || Keyboard.current.dKey.isPressed ||
+             Keyboard.current.upArrowKey.isPressed || Keyboard.current.downArrowKey.isPressed ||
+             Keyboard.current.leftArrowKey.isPressed || Keyboard.current.rightArrowKey.isPressed);
+        wasStickNeutral = input.magnitude < stickDeadzone && !anyMoveKeyHeld;
+    }
+
+    /// <summary>Called by MechCombat when a melee string/tackle STARTS. Wipes the
+    /// step double-tap memory so a direction tap made just BEFORE the melee press
+    /// can't pair with the first movement re-press DURING the string - that stale
+    /// pair read as a "double-tap", rainbow-stepped the player out of their own
+    /// attack, and the step momentum kept flying them into the enemy swinging at
+    /// nothing (the "movement stops my melee" bug). A rainbow step now requires
+    /// both taps to happen during the attack - still instant when deliberate.</summary>
+    /// <summary>Called by MechHealth when a knockdown starts and again when the mech
+    /// stands up. A down stops every coroutine this script owns (landing recovery,
+    /// stagger recovery, boost step), so without an explicit reset the state machine
+    /// can wake up stuck in Landing or BoostStep with nothing left alive to move it
+    /// on - the mech just stands there.</summary>
+    public void ForceResetAfterDown()
+    {
+        StopAllCoroutines();
+        currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
+        currentMomentum = Vector3.zero;
+        velocity = new Vector3(0f, -2f, 0f);
+        ResetStepFlickBuffer();
+        if (animator != null)
+        {
+            animator.speed = 1f;
+            animator.SetBool("IsAttacking", false);
+        }
+    }
+
+    public void ResetStepFlickBuffer()
+    {
+        lastFlickTime = -99f;
+        lastFlickDir = Vector2.zero;
+        wasStickNeutral = false;
     }
 
     // Lets MechCombat cut an in-progress step cleanly when the player does step -> melee
@@ -396,9 +491,13 @@ public class MechController : MonoBehaviour
         currentState = CheckIfGrounded() ? MechState.Grounded : MechState.Airborne;
     }
 
+    private Coroutine stepRoutine;
+    private float stepStartedAt = -99f;
+
     private IEnumerator ExecuteBoostStep(Vector2 dir)
     {
         currentState = MechState.BoostStep; boostManager.ConsumeBoost(boostManager.stepCost);
+        stepStartedAt = Time.time;
 
         Vector3 dirToTarget = enemyTarget != null ? (enemyTarget.position - transform.position).normalized : transform.forward;
         dirToTarget.y = 0;
@@ -415,7 +514,7 @@ public class MechController : MonoBehaviour
         float elapsed = 0f;
         while (elapsed < stepDuration)
         {
-            currentStepVelocity = stepVec.normalized * Mathf.Lerp(stepSpeed, walkSpeed, elapsed / stepDuration);
+            currentStepVelocity = stepVec.normalized * Mathf.Lerp(stepSpeed, walkSpeed, elapsed / stepDuration); // steps deliberately NOT speed-scaled - a dodge, not a traversal tool
             controller.Move(currentStepVelocity * Time.deltaTime);
             elapsed += Time.deltaTime; yield return null;
         }

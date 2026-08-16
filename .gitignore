@@ -104,3 +104,17 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# ---- project-specific: keep working files and build outputs out of the repo ----
+# build outputs and archives
+/EXE/
+/[Bb]eta [Bb]uild/
+/Final/
+/Backups/
+/CoworkHandoff_Output/
+
+# local working notes (not part of the submission)
+NIGHT*_SUMMARY.md
+QUESTIONS.md
+VIDEO_SCRIPT.md
+SUBMISSION_STEPS.md

@@ -28,6 +28,8 @@ public static class CombatVfxSetup
         { "vfx_Impact_01.prefab",      "hit.prefab" },
         { "vfx_Shield_01.prefab",      "block.prefab" },
         { "vfx_Electricity_01.prefab", "parry.prefab" },
+        { "vfx_Explosion_01.prefab",   "explosion.prefab" },
+        { "vfx_MuzzleFlash_01.prefab", "muzzle.prefab" },
     };
 
     static CombatVfxSetup()

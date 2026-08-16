@@ -11,6 +11,8 @@ public class MechShooter : MonoBehaviour
     [Header("Aiming Setup")]
     public Transform spineBone;
     public Transform armBone;
+    [Tooltip("Optional: the forearm. Aiming this too straightens the whole arm at the target while firing - it makes the mech visibly point the gun.")]
+    public Transform forearmBone;
 
     [Header("Bone Offsets (Adjust if twisted)")]
     public Vector3 spineAngleOffset;
@@ -90,6 +92,7 @@ public class MechShooter : MonoBehaviour
         if (currentAmmo <= 0) emptySince = Time.time;
 
         shootTimer = shootDuration; // hold the aim pose (original behavior)
+        CombatVfx.SpawnMuzzleFlash(muzzle != null ? muzzle : transform, MuzzleWorldPos());
         SpawnAimedShot(false);
     }
 
@@ -106,7 +109,15 @@ public class MechShooter : MonoBehaviour
         if (currentAmmo <= 0) emptySince = Time.time;
 
         shootTimer = shootDuration * 1.5f; // hold the aim pose a touch longer
+        CombatVfx.SpawnMuzzleFlash(muzzle != null ? muzzle : transform, MuzzleWorldPos());
         SpawnAimedShot(true);
+    }
+
+    private Vector3 MuzzleWorldPos()
+    {
+        return muzzle != null
+            ? muzzle.position
+            : transform.position + transform.forward * 1.2f + Vector3.up * 1.5f;
     }
 
     private void SpawnAimedShot(bool charged)
@@ -148,10 +159,20 @@ public class MechShooter : MonoBehaviour
 
         // Red lock at the moment of firing => the shot homes. Green lock / no target /
         // downed target => straight shot with no tracking (EXVS rule).
-        bool redLock = target != null &&
-                       Vector3.Distance(transform.position, target.position) <= redLockRange &&
-                       !IsYellowLocked(target);
-        shot.Init(redLock ? target : null, transform);
+        shot.Init(IsRedLock(target) ? target : null, transform);
+    }
+
+    /// <summary>
+    /// THE definition of red lock. The lock-on reticle calls this exact method, so
+    /// what the circle shows and what the bullet actually does cannot disagree -
+    /// which is precisely how the old display drifted out of sync (it measured its
+    /// own distance, against its own range value, on its own schedule).
+    /// </summary>
+    public bool IsRedLock(Transform t)
+    {
+        return t != null &&
+               Vector3.Distance(transform.position, t.position) <= redLockRange &&
+               !IsYellowLocked(t);
     }
 
     private bool IsYellowLocked(Transform t)
@@ -174,29 +195,47 @@ public class MechShooter : MonoBehaviour
             Transform target = GetTarget();
             if (target != null)
             {
-                // Aim slightly up so they shoot at the chest/head, not the feet
                 Vector3 targetPos = target.position + (Vector3.up * 1.5f);
 
-                // 1. Rotate the Upper Body (Spine) FIRST
+                // AXIS-FREE aiming. The old LookRotation + per-rig Euler offsets
+                // twisted the Gundam's arm into weird poses when firing (MMD bone
+                // axes differ from Mixamo's). Instead, rotate each bone by the
+                // small WORLD-SPACE delta that swings the actual limb direction
+                // onto the target line - works on any skeleton, any bone axes.
+
+                // 1. Torso: lean the chest toward the target (damped vertical)
                 if (spineBone != null)
                 {
-                    Vector3 spineDirection = targetPos - spineBone.position;
-                    if (spineDirection != Vector3.zero)
+                    Vector3 want = targetPos - spineBone.position;
+                    want.y *= 0.4f;
+                    if (want.sqrMagnitude > 0.01f)
                     {
-                        Quaternion spineLookRot = Quaternion.LookRotation(spineDirection) * Quaternion.Euler(spineAngleOffset);
-                        // Slerp blends the animation with the procedural aim so it doesn't snap unnaturally
-                        spineBone.rotation = Quaternion.Slerp(spineBone.rotation, spineLookRot, spineWeight);
+                        Quaternion delta = Quaternion.FromToRotation(transform.forward, want.normalized);
+                        spineBone.rotation = Quaternion.Slerp(Quaternion.identity, delta, spineWeight) * spineBone.rotation;
                     }
                 }
 
-                // 2. Rotate the Arm SECOND (To perfectly align the weapon)
+                // 2. Upper arm: swing the shoulder->elbow segment at the target
                 if (armBone != null)
                 {
-                    Vector3 armDirection = targetPos - armBone.position;
-                    if (armDirection != Vector3.zero)
+                    Vector3 cur = forearmBone != null ? (forearmBone.position - armBone.position) : transform.forward;
+                    Vector3 want = targetPos - armBone.position;
+                    if (cur.sqrMagnitude > 0.0005f && want.sqrMagnitude > 0.01f)
                     {
-                        Quaternion armLookRot = Quaternion.LookRotation(armDirection) * Quaternion.Euler(armAngleOffset);
-                        armBone.rotation = Quaternion.Slerp(armBone.rotation, armLookRot, armWeight);
+                        Quaternion delta = Quaternion.FromToRotation(cur.normalized, want.normalized);
+                        armBone.rotation = Quaternion.Slerp(Quaternion.identity, delta, armWeight) * armBone.rotation;
+                    }
+                }
+
+                // 3. Forearm fine-correct: point the gun line (forearm->muzzle) dead on
+                if (forearmBone != null && muzzle != null)
+                {
+                    Vector3 cur = muzzle.position - forearmBone.position;
+                    Vector3 want = targetPos - forearmBone.position;
+                    if (cur.sqrMagnitude > 0.0005f && want.sqrMagnitude > 0.01f)
+                    {
+                        Quaternion delta = Quaternion.FromToRotation(cur.normalized, want.normalized);
+                        forearmBone.rotation = Quaternion.Slerp(Quaternion.identity, delta, 0.65f) * forearmBone.rotation;
                     }
                 }
             }

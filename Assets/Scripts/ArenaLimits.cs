@@ -7,8 +7,8 @@
 /// </summary>
 public static class ArenaLimits
 {
-    public const float Radius = 70f;
-    public const float Ceiling = 34f;
+    public const float Radius = 160f;
+    public const float Ceiling = 70f;
 
     /// <summary>Corrective offset that pushes a position back inside the arena (zero when inside).</summary>
     public static Vector3 Correction(Vector3 position)
